@@ -1,4 +1,4 @@
-# 🎤 Video Karaoke Maker — Build Guide
+# Video Karaoke Maker — Build Guide
 
 Create installable apps for Windows (.exe) and macOS (.app).
 
@@ -19,7 +19,7 @@ karaoke-installer/
 ## Windows — Build .EXE Installer
 
 ### Prerequisites
-- Python 3.10, 3.11, or 3.12 (⚠️ avoid 3.13 — PyInstaller + PyTorch work best on 3.10-3.12)
+- Python 3.10, 3.11, or 3.12 ( avoid 3.13 — PyInstaller + PyTorch work best on 3.10-3.12)
 - Internet connection (to download dependencies)
 
 ### Build Steps
