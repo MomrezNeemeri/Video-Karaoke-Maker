@@ -1,48 +1,35 @@
 """
-🎤 Video Karaoke Maker — Installable Version
-Removes vocals from any video using Meta's Demucs AI model.
-Now with YouTube URL support!
+karaoke maker — strips vocals out of videos using demucs.
+also downloads from youtube. mostly.
 """
 
-# ═════════════════════════════════════════════════════════
-# STEP 1: Multiprocessing guard — MUST be the very first thing.
-# PyInstaller + PyTorch together can spawn worker processes that
-# re-execute this script, each opening a duplicate Tk window.
-# This block prevents that.
-# ═════════════════════════════════════════════════════════
+# ok so, this whole top bit is gross but it has to be first.
+# pyinstaller + pytorch loves spawning child processes that re-run
+# the whole script which means a second tk window pops up out of nowhere.
+# ask me how i found out
 import sys
 import os
-
-# Detect if we're a PyInstaller-spawned child process.
-# PyInstaller sets these env vars in child processes:
-_IS_CHILD = (
-    os.environ.get('_PYI_SPLASH_IPC') is not None or
-    os.environ.get('PYI_WORKFLOW_CHILD') == '1' or
-    # Standard multiprocessing env hint
-    os.environ.get('_MULTIPROCESSING_BOOTSTRAP') is not None
-)
 
 import multiprocessing
 multiprocessing.freeze_support()
 
-# If we're not the main process, exit silently
+# bail out fast if we're a spawned child
 if multiprocessing.current_process().name != "MainProcess":
     sys.exit(0)
 
-# Additional check: if sys.argv looks like a multiprocessing spawn
-# (contains "from multiprocessing.spawn import" or similar)
+# extra paranoia, sometimes the above isn't enough
 if any('multiprocessing' in str(a) and 'spawn' in str(a) for a in sys.argv):
     sys.exit(0)
 
-# Force spawn method (avoids fork-related tk issues on macOS)
 try:
     multiprocessing.set_start_method('spawn', force=True)
 except RuntimeError:
-    pass  # already set
+    pass
 
-# ═════════════════════════════════════════════════════════
-# STEP 2: Block torchcodec
-# ═════════════════════════════════════════════════════════
+# torchcodec was a nightmare on windows + py3.13 - dlls just refuse to load.
+# trick: shove fake empty modules into sys.modules BEFORE torch tries to import
+# them. torch checks sys.modules first so it finds these stubs and gives up
+# gracefully instead of exploding.
 import types
 
 for _name in [
@@ -58,8 +45,8 @@ for _name in [
 
 os.environ["TORCHAUDIO_USE_BACKEND_DISPATCHER"] = "1"
 
-# Use all available CPU cores for fast AI inference.
-# (Earlier these were set to 1 to debug threading issues — that's no longer needed.)
+# let torch use all the cores. spent way too long with these set to 1 trying
+# to debug something else, then forgot to change them back. don't be me
 import os as _os_for_cpu
 _cpu_count = _os_for_cpu.cpu_count() or 4
 os.environ["OMP_NUM_THREADS"] = str(_cpu_count)
@@ -68,13 +55,9 @@ os.environ["OPENBLAS_NUM_THREADS"] = str(_cpu_count)
 os.environ["VECLIB_MAXIMUM_THREADS"] = str(_cpu_count)
 os.environ["NUMEXPR_NUM_THREADS"] = str(_cpu_count)
 
-# ═════════════════════════════════════════════════════════
-# STEP 3: Fix stdout/stderr in windowed PyInstaller builds
-# (Windows --windowed apps have sys.stdout = None, which
-# crashes libraries like tqdm that try to write to it.)
-# ═════════════════════════════════════════════════════════
+# windowed pyinstaller apps on windows have stdout=None and tqdm CRASHES on that.
+# this null-stream class just absorbs writes and shrugs
 class _NullStream:
-    """A stream that accepts writes but does nothing."""
     def write(self, *args, **kwargs): pass
     def flush(self, *args, **kwargs): pass
     def isatty(self): return False
@@ -89,9 +72,6 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = _NullStream()
 
-# ─────────────────────────────────────────────────────────
-#  IMPORTS
-# ─────────────────────────────────────────────────────────
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
@@ -107,17 +87,17 @@ import torchaudio
 import soundfile as sf
 import numpy as np
 
-# Tell PyTorch directly how many threads to use (env vars alone aren't always enough)
+# env vars don't always stick, force it directly
 try:
     torch.set_num_threads(_cpu_count)
     torch.set_num_interop_threads(max(1, _cpu_count // 2))
 except Exception:
     pass
 
-# ─────────────────────────────────────────────────────────
-#  PATCH TORCHAUDIO
-# ─────────────────────────────────────────────────────────
 
+# replacing torchaudio's save/load with soundfile because torchaudio's default
+# backend on windows is sox which we DEFINITELY don't have, and the alternative
+# is ffmpeg-based which has its own can of worms. soundfile just works.
 def _sf_save(filepath, src, sample_rate, **kwargs):
     filepath = str(filepath)
     data = src.cpu().numpy().T
@@ -134,6 +114,7 @@ def _sf_load(filepath, **kwargs):
 torchaudio.save = _sf_save
 torchaudio.load = _sf_load
 
+# demucs has its own save_audio that goes through torchaudio, gotta patch that too
 import demucs.audio
 def _patched_save_audio(wav, path, samplerate, **kwargs):
     data = wav.cpu().numpy().T
@@ -144,11 +125,9 @@ from demucs.pretrained import get_model
 from demucs.apply import apply_model
 
 
-# ─────────────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────────────
-
-DEMUCS_MODEL = "htdemucs"  # Default to faster model (4x faster than htdemucs_ft, ~95% same quality)
+# htdemucs > htdemucs_ft for our purposes. ft is slightly better but 4x slower
+# and tbh the difference is barely audible
+DEMUCS_MODEL = "htdemucs"
 SUPPORTED_VIDEO = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v")
 SUPPORTED_AUDIO = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma")
 HIDE_CONSOLE = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if sys.platform == "win32" else 0
@@ -168,6 +147,9 @@ def get_downloads_folder():
 
 
 def get_ffmpeg_path():
+    # ffmpeg might be bundled with the app (pyinstaller) or on the system path.
+    # mac .app bundles are weird - the binary ends up in different spots
+    # depending on how pyinstaller felt that day, so check everything
     ffmpeg_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
 
     if getattr(sys, 'frozen', False):
@@ -206,6 +188,7 @@ def is_url(text):
 
 
 def sanitize_filename(name, max_length=100):
+    # windows hates these chars in filenames, also some of them are just illegal everywhere
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
     name = name.strip(' .')
     if len(name) > max_length:
@@ -213,15 +196,11 @@ def sanitize_filename(name, max_length=100):
     return name or "video"
 
 
+# special exception so we can show a nice dialog instead of a wall of error text
+# when youtube decides we look like a bot
 class BotDetectionError(Exception):
-    """Raised when YouTube blocks the download with bot detection.
-    Caught specially by the GUI to show a helpful workaround dialog."""
     pass
 
-
-# ─────────────────────────────────────────────────────────
-#  YOUTUBE DOWNLOADER
-# ─────────────────────────────────────────────────────────
 
 def check_ytdlp():
     try:
@@ -232,14 +211,8 @@ def check_ytdlp():
 
 
 def download_video(url, output_dir, ffmpeg_path, on_progress=None, on_status=None, browser_cookies=None):
-    """
-    Download a video from URL using yt-dlp.
-    Targets 720p, falls back to highest available.
-    Returns: (downloaded_filepath, video_title)
-
-    browser_cookies: None, or name of browser to use cookies from
-                    ('chrome', 'firefox', 'edge', 'safari', 'brave', 'opera')
-    """
+    """grab a video at 720p (or whatever's best if 720p doesn't exist).
+    returns (path_on_disk, video_title)."""
     try:
         import yt_dlp
     except ImportError:
@@ -252,6 +225,7 @@ def download_video(url, output_dir, ffmpeg_path, on_progress=None, on_status=Non
     on_status = on_status or (lambda s: None)
     on_progress = on_progress or (lambda v: None)
 
+    # ugly format string but it tries 720p mp4 first then degrades gracefully
     format_selector = (
         'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/'
         'bestvideo[height<=720]+bestaudio/'
@@ -260,6 +234,9 @@ def download_video(url, output_dir, ffmpeg_path, on_progress=None, on_status=Non
         'best'
     )
 
+    # yt-dlp downloads video and audio as 2 separate streams then merges them.
+    # this state dict tracks which one we're on so the progress bar doesn't
+    # bounce around like crazy (0-50% video, 50-100% audio)
     state = {
         'current_stream': 0,
         'total_streams': 2,
@@ -303,16 +280,18 @@ def download_video(url, output_dir, ffmpeg_path, on_progress=None, on_status=Non
         'no_warnings': True,
         'noprogress': True,
         'restrictfilenames': False,
+        # learned this the hard way: noplaylist alone isn't enough, also need
+        # the playlistend / playlist_items combo or it'll happily download all
+        # 200 videos in someone's playlist (RIP my ssd)
         'noplaylist': True,
         'playlistend': 1,
         'playlist_items': '1',
-        # Use a realistic User-Agent to look less bot-like
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                           '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         },
-        # Try multiple player clients — different clients have different bot checks
-        # iOS and mweb typically bypass desktop verification requirements
+        # ios and mweb clients have less aggressive bot checks than the desktop one.
+        # try them first before falling back to web
         'extractor_args': {
             'youtube': {
                 'player_client': ['ios', 'mweb', 'android', 'web'],
@@ -321,21 +300,22 @@ def download_video(url, output_dir, ffmpeg_path, on_progress=None, on_status=Non
         },
     }
 
-    # Add cookies if requested
     if browser_cookies:
         ydl_opts['cookiesfrombrowser'] = (browser_cookies,)
         on_status(f"Using cookies from {browser_cookies}...")
 
     def _attempt_download():
-        """Try to download once. Returns (path, title) or raises."""
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
+            # if it somehow returns a playlist anyway, just take the first video
             if info.get('_type') == 'playlist' and info.get('entries'):
                 info = info['entries'][0]
 
             downloaded_path = ydl.prepare_filename(info)
 
+            # yt-dlp sometimes returns the wrong extension after merging.
+            # check for the actual file
             if not os.path.exists(downloaded_path):
                 base = os.path.splitext(downloaded_path)[0]
                 for ext in ['.mp4', '.mkv', '.webm']:
@@ -356,22 +336,21 @@ def download_video(url, output_dir, ffmpeg_path, on_progress=None, on_status=Non
         err_msg = str(e)
         err_lower = err_msg.lower()
 
-        # ── Bot detection / sign-in required ──
+        # the dreaded "Sign in to confirm you're not a bot" message
         if ('sign in to confirm' in err_lower or
             'not a bot' in err_lower or
             'confirm you' in err_lower):
 
-            # If we already tried with cookies, raise special exception
             if browser_cookies:
+                # we already tried cookies once and it still failed, give up
                 raise BotDetectionError(
                     "YouTube is blocking the download even with browser cookies."
                 )
 
-            # Auto-retry with cookies from default browsers
+            # try cookies from each browser the user might have
             on_status("⚠️ YouTube needs verification — retrying with browser cookies...")
             on_progress(0)
 
-            # Pick a sensible default browser per-platform
             default_browsers = {
                 'darwin': ['safari', 'chrome', 'firefox', 'brave', 'edge'],
                 'win32':  ['chrome', 'edge', 'firefox', 'brave'],
@@ -389,19 +368,17 @@ def download_video(url, output_dir, ffmpeg_path, on_progress=None, on_status=Non
                 except Exception as retry_err:
                     err_str = str(retry_err)
                     last_err = err_str
-                    # If the browser isn't even installed, skip silently
+                    # browser not even installed - skip without spamming the user
                     if 'could not find' in err_str.lower() and 'cookies database' in err_str.lower():
                         continue
                     tried.append(browser)
                     continue
 
-            # All browsers failed — raise the special exception so the GUI
-            # can show a friendly workaround dialog
             raise BotDetectionError(
                 "YouTube is blocking the download from your IP address."
             )
 
-        # ── yt-dlp out of date ──
+        # yt-dlp version is stale - youtube changed something
         elif any(sig in err_lower for sig in [
             'signature extraction failed',
             'unable to extract',
@@ -428,16 +405,15 @@ def download_video(url, output_dir, ffmpeg_path, on_progress=None, on_status=Non
             raise RuntimeError(f"Download failed:\n\n{err_msg[:500]}")
 
     except BotDetectionError:
-        raise  # Pass through to GUI for special handling
+        raise
     except Exception as e:
         raise RuntimeError(f"Unexpected error during download:\n\n{str(e)[:500]}")
 
 
-# ─────────────────────────────────────────────────────────
-#  PROCESSING ENGINE
-# ─────────────────────────────────────────────────────────
-
 class KaraokeProcessor:
+    """does the actual work. runs in a worker thread so the gui doesn't freeze.
+    callbacks are how it talks back to the gui."""
+
     def __init__(self, input_source, output_path=None, model_name=DEMUCS_MODEL,
                  on_progress=None, on_status=None, on_done=None, on_error=None,
                  keep_vocals=False, is_url=False, delete_source_after=True):
@@ -476,12 +452,13 @@ class KaraokeProcessor:
                 self.on_done()
         except BotDetectionError as e:
             if not self.cancelled:
-                # Pass the special exception type so GUI can show special dialog
+                # tag this so the gui knows to show the special dialog
                 self.on_error(("__BOT_DETECTION__", str(e)))
         except Exception as e:
             if not self.cancelled:
                 self.on_error(f"{e}\n\n{traceback.format_exc()[-600:]}")
         finally:
+            # always clean up temp files even if something blew up
             if self.temp_dir and os.path.exists(self.temp_dir):
                 try:
                     shutil.rmtree(self.temp_dir)
@@ -489,6 +466,7 @@ class KaraokeProcessor:
                     pass
 
     def _pipeline_url(self):
+        # download (0-25%) → process video (25-100%)
         self._update("Downloading video from URL...", 0)
 
         download_dir = get_downloads_folder()
@@ -502,6 +480,7 @@ class KaraokeProcessor:
 
         if self.cancelled: return
 
+        # auto-name the output. if "X [karaoke].mp4" already exists, add (1), (2), etc
         if not self.output_path:
             safe_title = sanitize_filename(title)
             self.output_path = os.path.join(download_dir, f"{safe_title} [karaoke].mp4")
@@ -519,6 +498,7 @@ class KaraokeProcessor:
             progress_scale=0.75
         )
 
+        # delete the original download unless user said to keep it
         if self.delete_source_after and self.downloaded_video_path and os.path.exists(self.downloaded_video_path):
             try:
                 os.remove(self.downloaded_video_path)
@@ -527,12 +507,15 @@ class KaraokeProcessor:
                 pass
 
     def _pipeline_video(self, video_path, output_path, progress_offset=0, progress_scale=1.0):
+        # progress_offset/scale lets us reuse this from _pipeline_url where the
+        # download already ate the first 25%
         def scaled_progress(v):
             self.on_progress(progress_offset + int(v * progress_scale))
 
         wav_path = os.path.join(self.temp_dir, "audio.wav")
         inst_path = os.path.join(self.temp_dir, "instrumental.wav")
 
+        # 1. yank the audio out as wav
         self.on_status("Step 1/3 — Extracting audio...")
         scaled_progress(5)
         run_cmd([self.ffmpeg, "-y", "-i", video_path,
@@ -540,11 +523,13 @@ class KaraokeProcessor:
                 "FFmpeg failed to extract audio")
         if self.cancelled: return
 
+        # 2. demucs does its magic
         self.on_status("Step 2/3 — AI removing vocals (takes a while)...")
         scaled_progress(10)
         self._run_demucs(wav_path, inst_path, progress_cb=scaled_progress)
         if self.cancelled: return
 
+        # 3. swap original audio for the vocal-less version, keep original video stream
         self.on_status("Step 3/3 — Building karaoke video...")
         scaled_progress(90)
         run_cmd([self.ffmpeg, "-y", "-i", video_path, "-i", inst_path,
@@ -554,6 +539,7 @@ class KaraokeProcessor:
         scaled_progress(100)
 
     def _pipeline_audio(self, input_path, output_path):
+        # same as video pipeline but no video involved, simpler
         wav_path = os.path.join(self.temp_dir, "audio.wav")
         inst_path = os.path.join(self.temp_dir, "instrumental.wav")
 
@@ -587,15 +573,12 @@ class KaraokeProcessor:
         model = get_model(self.model_name)
         model.eval()
 
-        # Pick best available device:
-        #   cuda  → NVIDIA GPU (Windows/Linux with RTX/GTX cards) — fully supported
-        #   cpu   → Apple Silicon and everything else
-        #
-        # Note: We intentionally skip MPS (Apple Silicon GPU). Demucs uses
-        # convolutions with output channels > 65536, which exceeds Apple's
-        # MPS hard limit. Even with PYTORCH_ENABLE_MPS_FALLBACK=1, the constant
-        # CPU↔GPU memory shuffling makes it slower than native CPU. Apple Silicon
-        # CPU is plenty fast — an M1/M2/M3 processes a 4-min song in ~1-2 minutes.
+        # cuda for nvidia, cpu for everyone else.
+        # tried mps (apple silicon gpu) - demucs has conv layers with > 65536
+        # output channels and apple's mps just refuses, hard limit. even with
+        # the fallback flag it shuffles tensors between cpu and gpu so much
+        # that it ends up SLOWER than just using cpu directly. so we don't.
+        # M-series cpus are plenty fast anyway, ~1-2 min for a 4 min song
         if torch.cuda.is_available():
             device = "cuda"
             device_name = f"GPU ({torch.cuda.get_device_name(0)})"
@@ -613,6 +596,7 @@ class KaraokeProcessor:
         progress_cb(18)
         wav, sr = _sf_load(wav_path)
 
+        # demucs expects a specific sample rate
         if sr != model.samplerate:
             wav = torchaudio.functional.resample(wav, sr, model.samplerate)
             sr = model.samplerate
@@ -622,12 +606,16 @@ class KaraokeProcessor:
         self.on_status("AI is separating vocals — please wait...")
         progress_cb(25)
 
+        # the actual heavy lifting. num_workers=0 means do it in this process
+        # because workers would spawn more processes which would re-init torch which... nope
         with torch.no_grad():
             sources = apply_model(model, wav, device=device, progress=False, num_workers=0)
 
         progress_cb(85)
         if self.cancelled: return
 
+        # demucs splits audio into 4 stems: vocals, drums, bass, other.
+        # for karaoke we want everything-but-vocals so just sum the non-vocal stems
         source_names = model.sources
         self.on_status("Saving instrumental track...")
 
@@ -638,10 +626,12 @@ class KaraokeProcessor:
                 if name != "vocals":
                     instrumental += sources[0, i]
         else:
+            # fallback for weird models that don't have a "vocals" stem
             instrumental = sources[0, 0]
 
         _sf_save(output_instrumental_path, instrumental.cpu(), sr)
 
+        # if user wants the isolated vocals saved too (e.g. for remixing)
         if self.keep_vocals and "vocals" in source_names:
             vocals = sources[0, vocals_idx]
             vocals_path = str(Path(self.output_path).with_suffix("")) + "_vocals.wav"
@@ -654,11 +644,8 @@ class KaraokeProcessor:
         self.on_progress(progress)
 
 
-# ─────────────────────────────────────────────────────────
-#  GUI
-# ─────────────────────────────────────────────────────────
-
 class KaraokeApp:
+    # color palette - dark blue/red theme. picked these out of vibes
     BG        = "#1a1a2e"
     BG2       = "#16213e"
     CARD      = "#0f3460"
@@ -680,7 +667,7 @@ class KaraokeApp:
         self.root.minsize(660, 700)
         self.root.configure(bg=self.BG)
 
-        # ── Proper window-close handler ──
+        # without this the app keeps running in the background after window closes
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.processor = None
@@ -735,7 +722,7 @@ class KaraokeApp:
         ttk.Label(m, text="Remove vocals from any video using AI  •  Powered by Meta Demucs",
                   style="Sub.TLabel").pack(pady=(0, 16))
 
-        # Mode selector
+        # file vs URL toggle
         mode_frame = ttk.Frame(m, style="App.TFrame")
         mode_frame.pack(fill=tk.X, pady=(0, 10))
         ttk.Radiobutton(mode_frame, text="📁  Local File",
@@ -747,11 +734,11 @@ class KaraokeApp:
                          command=self._update_mode,
                          style="Mode.TRadiobutton").pack(side=tk.LEFT)
 
-        # Container for the dynamic input cards
+        # file/url cards swap in/out of this container based on mode
         self.input_container = ttk.Frame(m, style="App.TFrame")
         self.input_container.pack(fill=tk.X)
 
-        # FILE INPUT CARD
+        # local file input
         self.file_card = ttk.Frame(self.input_container, style="Card.TFrame", padding=15)
         ttk.Label(self.file_card, text="INPUT FILE", style="H.TLabel").pack(anchor=tk.W)
         ttk.Label(self.file_card, text="Select a video or audio file to remove vocals from",
@@ -762,7 +749,7 @@ class KaraokeApp:
         ttk.Button(r1, text="Browse...", style="Sm.TButton",
                    command=self._pick_input).pack(side=tk.RIGHT, padx=(8, 0))
 
-        # URL INPUT CARD
+        # youtube url input
         self.url_card = ttk.Frame(self.input_container, style="Card.TFrame", padding=15)
         ttk.Label(self.url_card, text="YOUTUBE URL", style="H.TLabel").pack(anchor=tk.W)
         ttk.Label(self.url_card,
@@ -772,7 +759,7 @@ class KaraokeApp:
         ur.pack(fill=tk.X)
         self._entry(ur, self.url_input)
 
-        # OUTPUT CARD (file mode only)
+        # output path picker - only shows in file mode (url mode auto-generates)
         self.output_card = ttk.Frame(m, style="Card.TFrame", padding=15)
         ttk.Label(self.output_card, text="OUTPUT FILE", style="H.TLabel").pack(anchor=tk.W)
         ttk.Label(self.output_card, text="Where to save the karaoke version",
@@ -783,7 +770,7 @@ class KaraokeApp:
         ttk.Button(out_row, text="Browse...", style="Sm.TButton",
                    command=self._pick_output).pack(side=tk.RIGHT, padx=(8, 0))
 
-        # URL OUTPUT INFO CARD (url mode only)
+        # info card for url mode
         self.url_output_card = ttk.Frame(m, style="Card.TFrame", padding=15)
         ttk.Label(self.url_output_card, text="OUTPUT", style="H.TLabel").pack(anchor=tk.W)
         ttk.Label(self.url_output_card,
@@ -791,7 +778,7 @@ class KaraokeApp:
                        "(named after the video title, with [karaoke] suffix)",
                   style="B.TLabel").pack(anchor=tk.W, pady=(2, 0))
 
-        # OPTIONS CARD
+        # options
         c3 = ttk.Frame(m, style="Card.TFrame", padding=15)
         c3.pack(fill=tk.X, pady=(10, 10))
         ttk.Label(c3, text="OPTIONS", style="H.TLabel").pack(anchor=tk.W)
@@ -805,7 +792,7 @@ class KaraokeApp:
                          variable=self.keep_vocals,
                          style="Card.TCheckbutton").pack(side=tk.LEFT)
 
-        # URL-specific option
+        # this checkbox only shows in url mode
         self.keep_orig_check = ttk.Checkbutton(c3, text="Keep original downloaded video (don't auto-delete)",
                                                 variable=self.keep_original_video,
                                                 style="Card.TCheckbutton")
@@ -814,7 +801,6 @@ class KaraokeApp:
             text="htdemucs_ft = Best quality (slower)  •  htdemucs = Faster  •  mdx_extra = Alternative",
             style="B.TLabel").pack(anchor=tk.W, pady=(6, 0))
 
-        # Buttons
         bf = ttk.Frame(m, style="App.TFrame")
         bf.pack(fill=tk.X, pady=(10, 10))
         self.start_btn = ttk.Button(bf, text="🎵  MAKE KARAOKE", style="Big.TButton",
@@ -824,7 +810,6 @@ class KaraokeApp:
                                       command=self._cancel, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.RIGHT, padx=(10, 0))
 
-        # Progress
         self.progress = ttk.Progressbar(m, style="Bar.Horizontal.TProgressbar",
                                          mode="determinate", maximum=100)
         self.progress.pack(fill=tk.X, pady=(5, 5))
@@ -833,6 +818,7 @@ class KaraokeApp:
         self.status_lbl.pack(anchor=tk.W)
 
     def _entry(self, parent, var):
+        # standard text entry, just styled to match the theme
         e = tk.Entry(parent, textvariable=var,
                      bg=self.ENTRY_BG, fg=self.TEXT, insertbackground=self.TEXT,
                      font=("Segoe UI", 10), bd=0,
@@ -842,6 +828,7 @@ class KaraokeApp:
         return e
 
     def _update_mode(self):
+        # show/hide cards based on whether we're in file or url mode
         if self.mode.get() == self.MODE_FILE:
             self.url_card.pack_forget()
             self.file_card.pack(fill=tk.X, pady=(0, 10))
@@ -863,6 +850,7 @@ class KaraokeApp:
         )
         if p:
             self.input_path.set(p)
+            # auto-fill output with same name + _karaoke suffix
             out = Path(p)
             self.output_path.set(str(out.with_stem(out.stem + "_karaoke")))
 
@@ -925,7 +913,9 @@ class KaraokeApp:
         self.cancel_btn.config(state=tk.NORMAL)
         self.progress["value"] = 0
 
-        # Safe callback helpers — silently ignore if root is destroyed
+        # if user closes the window mid-processing, root is gone but the
+        # worker thread doesn't know that and tries to call gui methods.
+        # safe_after just swallows TclError when that happens
         def safe_after(fn):
             try:
                 self.root.after(0, fn)
@@ -984,7 +974,7 @@ class KaraokeApp:
         self.status_lbl.config(style="Status.TLabel")
 
     def _fail(self, msg):
-        # Check if this is the special bot-detection signal
+        # if it's the special bot-detection signal, show the nice dialog instead
         if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "__BOT_DETECTION__":
             self._reset("YouTube blocked the download")
             self._show_bot_detection_dialog()
@@ -994,7 +984,9 @@ class KaraokeApp:
         messagebox.showerror("Something went wrong", msg)
 
     def _show_bot_detection_dialog(self):
-        """Custom dialog for YouTube bot detection — points to cobalt.tools workaround."""
+        # custom dialog instead of a generic error popup. points users to
+        # cobalt.tools which is way more reliable for grabbing youtube videos
+        # than fighting yt-dlp's bot checks
         import webbrowser
 
         dialog = tk.Toplevel(self.root)
@@ -1005,7 +997,7 @@ class KaraokeApp:
         dialog.transient(self.root)
         dialog.grab_set()
 
-        # Center on parent
+        # center on the parent window
         dialog.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() - 560) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - 440) // 2
@@ -1014,12 +1006,10 @@ class KaraokeApp:
         container = tk.Frame(dialog, bg=self.BG, padx=24, pady=20)
         container.pack(fill=tk.BOTH, expand=True)
 
-        # Icon + Title
         tk.Label(container, text="⚠️  YouTube Blocked the Download",
                  bg=self.BG, fg=self.ACCENT,
                  font=("Segoe UI", 14, "bold")).pack(anchor=tk.W, pady=(0, 12))
 
-        # Explanation
         explanation = (
             "YouTube's bot-detection is blocking direct downloads from your "
             "computer. This is increasingly common and not something this app "
@@ -1032,7 +1022,6 @@ class KaraokeApp:
                  font=("Segoe UI", 10),
                  wraplength=510, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 14))
 
-        # Step-by-step
         steps = tk.Frame(container, bg=self.CARD, padx=16, pady=14)
         steps.pack(fill=tk.X, pady=(0, 16))
 
@@ -1047,7 +1036,6 @@ class KaraokeApp:
                  font=("Segoe UI", 10),
                  justify=tk.LEFT).pack(anchor=tk.W)
 
-        # Buttons row
         btn_row = tk.Frame(container, bg=self.BG)
         btn_row.pack(fill=tk.X, pady=(4, 0))
 
@@ -1061,7 +1049,8 @@ class KaraokeApp:
             dialog.grab_release()
             dialog.destroy()
 
-        # Style buttons inline (Toplevel doesn't always inherit ttk styles cleanly)
+        # using regular tk buttons (not ttk) because ttk styling on Toplevel
+        # is inconsistent across platforms and i gave up
         cobalt_btn = tk.Button(btn_row, text="🔗  Open cobalt.tools",
                                 command=open_cobalt,
                                 bg=self.ACCENT, fg="white",
@@ -1095,24 +1084,21 @@ class KaraokeApp:
             self.status_lbl.config(text=status)
 
     def _on_close(self):
-        """Handle window close — cleanly stop everything before exiting."""
-        # Signal the processor to stop
+        # cancel any running work
         if self.processor:
             try:
                 self.processor.cancel()
             except Exception:
                 pass
 
-        # Destroy the Tk root
         try:
             self.root.quit()
             self.root.destroy()
         except Exception:
             pass
 
-        # Force-kill the whole Python process (including any lingering threads,
-        # subprocess, torch workers, etc). Without this, the PyInstaller app
-        # can hang in the task manager because torch/numpy leave threads alive.
+        # nuclear option. without this torch leaves threads alive and the app
+        # just hangs around in task manager forever even after window closes
         os._exit(0)
 
     def run(self):
@@ -1121,7 +1107,7 @@ class KaraokeApp:
         except KeyboardInterrupt:
             pass
         finally:
-            # Belt and suspenders: if mainloop exits normally, still force-kill
+            # if mainloop ever exits naturally, make sure we still die
             os._exit(0)
 
 
