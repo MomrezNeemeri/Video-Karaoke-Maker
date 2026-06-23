@@ -1,85 +1,123 @@
-#!/bin/bash
-# ══════════════════════════════════════════════════════
-#   Build Video Karaoke Maker for macOS
-#   Creates: dist/KaraokeMaker.app
-# ══════════════════════════════════════════════════════
-
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════════════════
+#   Build Video Karaoke Maker for macOS (.app)
+#
+#   Produces a self-contained app bundle. END USERS install NOTHING —
+#   FFmpeg and libmpv are bundled inside the .app.
+#
+#   You (the builder) need Homebrew + ffmpeg + mpv installed once,
+#   so this script can copy their binaries/dylibs into the bundle.
+# ══════════════════════════════════════════════════════════════
 set -e
-
-# Always run from the directory where this script lives
 cd "$(dirname "$0")"
 
-echo ""
-echo "========================================"
-echo "  Building Video Karaoke Maker (macOS)"
-echo "========================================"
-echo ""
+# everything builds inside this one folder to keep the project tidy
+WORK="_build_workspace"
+FINAL="KaraokeMaker_App"
+mkdir -p "$WORK"
 
-# Step 1: Find Python 3.12 (Homebrew) or fall back to python3
-PYTHON=""
-if [ -x "/opt/homebrew/opt/python@3.12/bin/python3.12" ]; then
-    PYTHON="/opt/homebrew/opt/python@3.12/bin/python3.12"
-elif command -v python3.12 &> /dev/null; then
-    PYTHON="python3.12"
-elif command -v python3 &> /dev/null; then
-    PYTHON="python3"
-else
-    echo "ERROR: Python not found. Install via: brew install python@3.12 python-tk@3.12"
+echo
+echo "========================================"
+echo "   Building Video Karaoke Maker (macOS)"
+echo "========================================"
+echo
+
+# ---- prerequisites check ----
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 not found. Install Python 3.10-3.12 (brew install python@3.12)."
     exit 1
 fi
 
-echo "Using Python: $PYTHON ($($PYTHON --version))"
-
-# Verify tkinter works
-if ! $PYTHON -c "import tkinter" 2>/dev/null; then
-    echo "ERROR: tkinter not found. Install via: brew install python-tk@3.12"
+if ! command -v brew >/dev/null 2>&1; then
+    echo "ERROR: Homebrew not found. Install from https://brew.sh then re-run."
     exit 1
 fi
-echo "tkinter: OK"
 
-# Step 2: Create virtual environment
-echo "[1/5] Creating virtual environment..."
-rm -rf build_env
-$PYTHON -m venv build_env
-source build_env/bin/activate
+# ffmpeg + mpv provide the binaries/dylibs we bundle. install if missing.
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "Installing ffmpeg (one-time, for bundling)..."
+    brew install ffmpeg
+fi
+if ! brew list mpv >/dev/null 2>&1; then
+    echo "Installing mpv (one-time, provides libmpv for bundling)..."
+    brew install mpv
+fi
 
-# Step 3: Install dependencies
-echo "[2/5] Installing dependencies (this takes a few minutes)..."
+echo "[1/6] Creating virtual environment..."
+rm -rf "$WORK/build_env"
+python3 -m venv "$WORK/build_env"
+source "$WORK/build_env/bin/activate"
+
+echo "[2/6] Installing Python dependencies..."
 pip install --upgrade pip
-pip install torch==2.5.1 torchaudio==2.5.1
+# CPU PyTorch is fine on Mac (Apple Silicon CPU is fast; mps isn't used by demucs here)
+pip install torch torchaudio
 pip install demucs soundfile pyinstaller yt-dlp
-
-# Uninstall torchcodec if present
+pip install python-mpv
+pip install -U yt-dlp
 pip uninstall torchcodec -y 2>/dev/null || true
 
-# Step 4: Get FFmpeg
-echo "[3/5] Setting up FFmpeg..."
-mkdir -p ffmpeg_build
-if [ ! -f ffmpeg_build/ffmpeg ]; then
-    # Try copying from Homebrew first
-    BREW_FFMPEG="$(brew --prefix ffmpeg 2>/dev/null)/bin/ffmpeg"
-    BREW_FFPROBE="$(brew --prefix ffmpeg 2>/dev/null)/bin/ffprobe"
-    if [ -f "$BREW_FFMPEG" ]; then
-        cp "$BREW_FFMPEG" ffmpeg_build/ffmpeg
-        cp "$BREW_FFPROBE" ffmpeg_build/ffprobe
-        echo "Copied FFmpeg from Homebrew."
-    else
-        echo "ERROR: FFmpeg not found. Install via: brew install ffmpeg"
-        exit 1
-    fi
-fi
-chmod +x ffmpeg_build/ffmpeg ffmpeg_build/ffprobe
+echo "[3/6] Locating FFmpeg binaries to bundle..."
+mkdir -p "$WORK/ffmpeg_build"
+FFMPEG_BIN="$(command -v ffmpeg)"
+FFPROBE_BIN="$(command -v ffprobe)"
+cp -f "$FFMPEG_BIN"  "$WORK/ffmpeg_build/ffmpeg"
+cp -f "$FFPROBE_BIN" "$WORK/ffmpeg_build/ffprobe"
+echo "  ffmpeg:  $FFMPEG_BIN"
+echo "  ffprobe: $FFPROBE_BIN"
 
-# Step 5: Build with PyInstaller
-echo "[4/5] Building application with PyInstaller..."
+echo "[4/6] Locating libmpv to bundle..."
+mkdir -p "$WORK/mpv_build"
+# Homebrew installs libmpv as a versioned dylib. Find the real file.
+MPV_PREFIX="$(brew --prefix mpv 2>/dev/null || true)"
+LIBMPV=""
+for cand in \
+    "$MPV_PREFIX/lib/libmpv.dylib" \
+    "$MPV_PREFIX/lib/libmpv.2.dylib" \
+    "$(brew --prefix)/lib/libmpv.dylib" \
+    "$(brew --prefix)/lib/libmpv.2.dylib"; do
+    if [ -e "$cand" ]; then
+        # resolve symlink to the actual file
+        LIBMPV="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$cand")"
+        break
+    fi
+done
+
+if [ -z "$LIBMPV" ] || [ ! -e "$LIBMPV" ]; then
+    echo "WARNING: could not locate libmpv.dylib via Homebrew."
+    echo "The Playback tab will be disabled. Try: brew reinstall mpv"
+else
+    cp -f "$LIBMPV" "$WORK/mpv_build/libmpv.2.dylib"
+    echo "  libmpv:  $LIBMPV"
+fi
+
+echo "[4b/6] Pre-downloading the AI model (so users never have to)..."
+MODELDIR="$WORK/model_cache"
+mkdir -p "$MODELDIR/checkpoints"
+python3 -c "import torch; torch.hub.set_dir('$MODELDIR'); from demucs.pretrained import get_model; get_model('htdemucs'); print('Model ready.')" \
+    || echo "WARNING: model pre-download failed; users will download on first run."
+
+echo "[5/6] Building application with PyInstaller..."
+ADD_BINARIES=(
+    --add-binary "$WORK/ffmpeg_build/ffmpeg:."
+    --add-binary "$WORK/ffmpeg_build/ffprobe:."
+)
+if [ -e "$WORK/mpv_build/libmpv.2.dylib" ]; then
+    ADD_BINARIES+=( --add-binary "$WORK/mpv_build/libmpv.2.dylib:." )
+fi
+
 pyinstaller \
     --name "KaraokeMaker" \
     --onedir \
     --windowed \
     --noconfirm \
     --clean \
-    --add-binary "ffmpeg_build/ffmpeg:." \
-    --add-binary "ffmpeg_build/ffprobe:." \
+    --workpath "$WORK/build" \
+    --distpath "$WORK/dist" \
+    --specpath "$WORK" \
+    --add-data "$MODELDIR:model_cache" \
+    "${ADD_BINARIES[@]}" \
+    --hidden-import "mpv" \
     --hidden-import "soundfile" \
     --hidden-import "numpy" \
     --hidden-import "numpy.core.multiarray" \
@@ -104,21 +142,44 @@ pyinstaller \
     --collect-all "demucs" \
     --collect-all "diffq" \
     --collect-all "openunmix" \
-    --collect-all "numpy" \
     --collect-all "yt_dlp" \
-    --osx-bundle-identifier "com.karaokemaker.app" \
+    --collect-all "torch" \
+    --exclude-module "torch.utils.tensorboard" \
+    --exclude-module "tensorboard" \
+    --exclude-module "torch.testing" \
+    --exclude-module "torchaudio.prototype" \
+    --exclude-module "numpy.f2py" \
+    --exclude-module "numpy.distutils" \
+    --exclude-module "numpy.testing" \
+    --exclude-module "matplotlib" \
+    --exclude-module "pandas" \
+    --exclude-module "IPython" \
+    --exclude-module "pytest" \
+    --exclude-module "PIL" \
+    --exclude-module "tkinter.test" \
     karaoke_maker.py
 
-echo "[5/5] Done!"
+echo "[6/6] Cleaning up..."
+deactivate || true
 
-deactivate
+# move the finished .app out to a clean, easy-to-find folder
+rm -rf "$FINAL"
+mkdir -p "$FINAL"
+if [ -d "$WORK/dist/KaraokeMaker.app" ]; then
+    cp -R "$WORK/dist/KaraokeMaker.app" "$FINAL/KaraokeMaker.app"
+fi
 
-echo ""
+echo
 echo "========================================"
-echo "  BUILD COMPLETE!"
-echo "  App: dist/KaraokeMaker.app"
+echo "   BUILD COMPLETE!"
+echo "   App: $FINAL/KaraokeMaker.app"
+echo "   (Build scratch files are in $WORK/ — delete anytime.)"
 echo "========================================"
-echo ""
-echo "To create a DMG for distribution:"
-echo "  hdiutil create -volname KaraokeMaker -srcfolder dist/KaraokeMaker.app -ov -format UDZO KaraokeMaker.dmg"
-echo ""
+echo
+echo "To make a shareable DMG:"
+echo "  hdiutil create -volname KaraokeMaker \\"
+echo "    -srcfolder $FINAL/KaraokeMaker.app -ov -format UDZO KaraokeMaker.dmg"
+echo
+echo "Users just drag the .app to Applications and run it — no installs needed."
+echo "(First launch: right-click -> Open, since the app isn't Apple-signed.)"
+echo

@@ -1,134 +1,60 @@
-# Video Karaoke Maker — Build Guide
+# Video Karaoke Maker
 
-Create installable apps for Windows (.exe) and macOS (.app).
+Strips the vocals out of a song so you can sing over it, with a built-in player to change the key and speed live. Feed it a video file or a YouTube link and you get a karaoke version back.
 
----
+Built with Python/Tkinter on top of [Demucs](https://github.com/facebookresearch/demucs) (vocal removal), FFmpeg, and mpv.
 
-## Project Structure
+## Two tabs
 
-```
-karaoke-installer/
-├── karaoke_maker.py      ← Main app (packagable version)
-├── build_windows.bat     ← Windows build script
-├── build_mac.sh          ← macOS build script
-└── README.md             ← This file
-```
+- **Convert Karaoke** — drop in a video/audio file or paste a YouTube URL, and it removes the vocals. Seconds on an NVIDIA GPU, a few minutes on CPU.
+- **Playback** — open any video (including one you just made) and tweak **key** and **tempo** with sliders while you sing. They're independent: change the key without changing the speed, and vice-versa. Has fullscreen and a "save this version" export.
 
----
+## Just want to use it?
 
-## Windows — Build .EXE Installer
+No Python or installs needed. Download from [Releases](../../releases), unzip, and run `KaraokeMaker.exe` (Windows) or open `KaraokeMaker.app` (Mac). Everything's bundled. On Mac, right-click → Open the first time (it's unsigned).
 
-### Prerequisites
-- Python 3.10, 3.11, or 3.12 ( avoid 3.13 — PyInstaller + PyTorch work best on 3.10-3.12)
-- Internet connection (to download dependencies)
+## How it works
 
-### Build Steps
-
-1. Open Command Prompt **as Administrator**
-2. Navigate to the project folder:
-   ```
-   cd path\to\karaoke-installer
-   ```
-3. Run the build script:
-   ```
-   build_windows.bat
-   ```
-4. Wait ~10-15 minutes (downloads PyTorch, builds the app)
-5. Your app is in: `dist\KaraokeMaker\`
-
-### Distribute
-
-Zip the entire `dist\KaraokeMaker\` folder and share it. Users just unzip and double-click `KaraokeMaker.exe`.
-
-The app is self-contained — **no Python or FFmpeg install needed** for the person running it.
-
-> **Size warning:** The final folder will be ~2-3 GB because it includes the entire PyTorch AI engine. This is normal for AI-powered desktop apps.
-
----
-
-## macOS — Build .APP Bundle
-
-### Prerequisites
-- Python 3.10, 3.11, or 3.12 (install via `brew install python@3.12`)
-- Xcode Command Line Tools: `xcode-select --install`
-- Homebrew (recommended): [brew.sh](https://brew.sh)
-- FFmpeg: `brew install ffmpeg`
-
-### Build Steps
-
-1. Open Terminal
-2. Navigate to the project folder:
-   ```
-   cd path/to/karaoke-installer
-   ```
-3. Make the script executable and run it:
-   ```
-   chmod +x build_mac.sh
-   ./build_mac.sh
-   ```
-4. Wait ~10-15 minutes
-5. Your app is: `dist/KaraokeMaker.app`
-
-### Create a DMG for Distribution
-
-```bash
-hdiutil create -volname "KaraokeMaker" \
-  -srcfolder dist/KaraokeMaker.app \
-  -ov -format UDZO \
-  KaraokeMaker.dmg
-```
-
-This creates a `KaraokeMaker.dmg` file users can download and drag to Applications.
-
-### macOS Gatekeeper Note
-
-Since the app isn't signed with an Apple Developer certificate, users will need to:
-1. Right-click the app → "Open" (first time only)
-2. Click "Open" in the security dialog
-
-To sign the app properly (optional, requires $99/year Apple Developer account):
-```bash
-codesign --deep --force --sign "Developer ID Application: YOUR NAME" dist/KaraokeMaker.app
-```
-
----
-
-## Troubleshooting
-
-### Build fails with "ModuleNotFoundError"
-Add the missing module to the `--hidden-import` list in the build script and rebuild.
-
-### App is too large
-To reduce size (~500MB savings), use CPU-only PyTorch. The build scripts already do this for Windows. For macOS, change the pip install line to:
-```
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-```
-
-### "Model not found" on first run
-The AI model (~200MB) downloads automatically on first use. The user needs internet for the first run. To pre-bundle the model:
-```python
-# Run this once, then copy the model cache into the build
-python -c "from demucs.pretrained import get_model; get_model('htdemucs_ft')"
-```
-The model cache is at:
-- Windows: `%USERPROFILE%\.cache\torch\hub\checkpoints\`
-- macOS: `~/.cache/torch/hub/checkpoints/`
-
-### PyInstaller + Python 3.13 issues
-Use Python 3.10-3.12 for building. Python 3.13 has compatibility issues with PyInstaller and PyTorch.
-
----
-
-## How It Works Under the Hood
+**Convert tab** — pull the vocals out and rebuild the video:
 
 ```
-┌─────────────┐     ┌──────────┐     ┌───────────────┐     ┌──────────┐
-│ Input Video  │────►│  FFmpeg  │────►│  Demucs AI    │────►│  FFmpeg  │────► Karaoke Video
-│ (MP4/MKV/..)│     │ Extract  │     │ Remove Vocals │     │ Merge    │     (no vocals)
-└─────────────┘     │ Audio    │     │ (PyTorch)     │     │ Back     │
-                    └──────────┘     └───────────────┘     └──────────┘
+Input Video ──► FFmpeg (extract audio) ──► Demucs (remove vocals) ──► FFmpeg (merge back) ──► Karaoke Video
 ```
 
-**Demucs** by Meta Research is a state-of-the-art music source separation model. It uses a hybrid transformer + U-Net architecture trained on thousands of songs to separate vocals, drums, bass, and other instruments.
+The model (~80 MB) ships inside the app, so it works offline.
 
-The `htdemucs_ft` model (fine-tuned version) produces the best results and is used by default.
+**Playback tab** — play it back, adjust live, optionally save a copy:
+
+```
+Any Video ──► mpv player ──► adjust key/tempo live ──► (Save) FFmpeg re-render ──► New Video
+```
+
+Key and tempo are independent — change one without touching the other.
+
+## Building from source
+
+Pick one:
+
+- **`build_windows.bat`** — GPU build (CUDA). Fastest, ~4 GB. Needs Python 3.10–3.12 (no CUDA wheels for 3.13).
+- **`build_windows_cpu.bat`** — CPU build. ~1 GB, runs on any PC, works on Python 3.10–3.13, but separation is slower.
+- **`build_mac.sh`** — Mac build (CPU). Needs [Homebrew](https://brew.sh) + Python 3.10–3.12; it pulls in FFmpeg/mpv for you.
+
+The Playback tab needs `libmpv-2.dll` (Windows) — the script bundles it, but drop one next to the script if it's missing. Grab it from the [shinchiro builds](https://github.com/shinchiro/mpv-winbuild-cmake/releases) (`mpv-dev-x86_64-*.7z`). Without it, only the Playback tab is disabled.
+
+### Run from source (dev)
+
+```
+python -m venv venv && venv\Scripts\activate
+pip install torch torchaudio        # add --index-url .../whl/cu121 for GPU
+pip install demucs soundfile yt-dlp python-mpv
+python karaoke_maker.py
+```
+
+FFmpeg, ffprobe, and libmpv need to be on PATH or in the project folder.
+
+## Notes
+
+- Vocal separation is RAM/CPU heavy — rough on 4 GB laptops. Playback is light.
+- Tempo exports re-encode the video (a few minutes); pitch-only exports are instant.
+
+Built on [Demucs](https://github.com/facebookresearch/demucs), [FFmpeg](https://ffmpeg.org/), [mpv](https://mpv.io/), and [yt-dlp](https://github.com/yt-dlp/yt-dlp).

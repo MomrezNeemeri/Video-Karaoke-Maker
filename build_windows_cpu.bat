@@ -1,34 +1,32 @@
 @echo off
 REM ==============================================================
-REM   Build Video Karaoke Maker for Windows (Universal)
+REM   Build Video Karaoke Maker for Windows -- CPU-ONLY edition
 REM
-REM   Uses NVIDIA GPU when available, falls back to CPU otherwise.
-REM   All build files go inside "_build_workspace" to keep things tidy.
-REM   The finished app is copied out to "KaraokeMaker_App".
+REM   No NVIDIA CUDA libraries. Smaller download (~1 GB vs ~4 GB).
+REM   Runs on ANY Windows 10/11 PC, GPU or not -- but vocal
+REM   separation uses the CPU, so it is slower than the GPU build.
 REM
-REM   Bundle size: ~4 GB. Works on any Windows 10/11 PC.
+REM   Works with Python 3.10 - 3.13 (CPU torch has 3.13 wheels).
+REM   Build files go in "_build_workspace_cpu"; final app in
+REM   "KaraokeMaker_App_CPU" so it does not clash with the GPU build.
 REM ==============================================================
 
 setlocal enableextensions
 
 cd /d "%~dp0"
 
-set "WORK=_build_workspace"
-set "FINAL=KaraokeMaker_App"
-REM absolute path to the workspace - needed for --add-binary so PyInstaller
-REM (which runs relative to --specpath) does not double the folder name.
+set "WORK=_build_workspace_cpu"
+set "FINAL=KaraokeMaker_App_CPU"
 set "WORKABS=%~dp0%WORK%"
 
 echo.
 echo ========================================
-echo   Building Video Karaoke Maker
+echo   Building Video Karaoke Maker (CPU-only)
 echo   Work folder: %WORK%\
 echo ========================================
 echo.
 
-REM ---- Pick a Python that has CUDA torch wheels (3.10-3.12) ----
-REM PyTorch CUDA (cu121) wheels do NOT exist for Python 3.13+, so we
-REM explicitly look for 3.12, then 3.11, then 3.10 via the py launcher.
+REM ---- Pick any Python 3.10-3.13 (CPU torch supports all of them) ----
 set "PYEXE="
 
 py -3.12 --version >nul 2>&1
@@ -43,21 +41,30 @@ if %errorlevel%==0 (
     goto have_python
 )
 
+py -3.13 --version >nul 2>&1
+if %errorlevel%==0 (
+    set "PYEXE=py -3.13"
+    goto have_python
+)
+
 py -3.10 --version >nul 2>&1
 if %errorlevel%==0 (
     set "PYEXE=py -3.10"
     goto have_python
 )
 
+REM fall back to whatever 'python' is on PATH
+python --version >nul 2>&1
+if %errorlevel%==0 (
+    set "PYEXE=python"
+    goto have_python
+)
+
 echo.
 echo ============================================================
-echo  ERROR: No compatible Python found (need 3.10, 3.11, or 3.12).
-echo.
-echo  Python 3.13+ has NO CUDA PyTorch wheels, so the GPU build
-echo  cannot proceed. Install Python 3.12 from:
+echo  ERROR: No Python found. Install Python 3.10-3.13 from:
 echo    https://www.python.org/downloads/windows/
 echo  (tick "Add python.exe to PATH"), then re-run this script.
-echo  You do NOT need to uninstall 3.13.
 echo ============================================================
 echo.
 pause
@@ -76,17 +83,17 @@ if exist "%WORK%\build_env" rmdir /s /q "%WORK%\build_env"
 call "%WORK%\build_env\Scripts\activate.bat"
 
 echo.
-echo [2/5] Installing dependencies (CUDA 12.1 PyTorch, ~2 GB download)...
+echo [2/5] Installing dependencies (CPU PyTorch, much smaller download)...
 python -m pip install --upgrade pip
-python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 REM Stop early if torch did not install, instead of building an empty dist.
 python -c "import torch" >nul 2>&1
 if errorlevel 1 (
     echo.
     echo ============================================================
-    echo  ERROR: PyTorch failed to install.
-    echo  Make sure you are on Python 3.10-3.12 and try again.
+    echo  ERROR: PyTorch CPU build failed to install. Check your
+    echo  internet connection and Python version, then try again.
     echo ============================================================
     echo.
     pause
@@ -115,7 +122,6 @@ echo.
 echo [3b/5] Setting up libmpv (for the Playback tab)...
 if not exist "%WORK%\mpv_build" mkdir "%WORK%\mpv_build"
 
-REM Preferred: reuse the libmpv-2.dll you already have next to this script.
 if exist libmpv-2.dll (
     copy /y libmpv-2.dll "%WORK%\mpv_build\libmpv-2.dll" >nul
     echo Using existing libmpv-2.dll from project folder.
@@ -129,14 +135,14 @@ pushd "%WORK%\mpv_build"
 REM NOTE: this URL ages out. If it 404s, download the latest
 REM   mpv-dev-x86_64-*.7z  from
 REM   https://github.com/shinchiro/mpv-winbuild-cmake/releases
-REM   extract libmpv-2.dll, and place it next to build_windows.bat.
+REM   extract libmpv-2.dll, and place it next to this script.
 curl -L -o mpv.7z https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-x86_64-20260610-git-304426c.7z
 where 7z >nul 2>&1
 if %errorlevel%==0 (
     7z x mpv.7z -y >nul
 ) else (
     echo WARNING: 7-Zip not found, cannot auto-extract libmpv.
-    echo Place libmpv-2.dll next to build_windows.bat and re-run.
+    echo Place libmpv-2.dll next to this script and re-run.
 )
 popd
 
@@ -154,9 +160,6 @@ if not exist "%WORK%\mpv_build\libmpv-2.dll" (
 
 echo.
 echo [3c/5] Pre-downloading the AI model (so users never have to)...
-REM Download the htdemucs weights into model_cache\checkpoints now, then
-REM bundle that folder. The app points torch.hub at it, so end users get
-REM NO first-run download and full offline use.
 set "MODELDIR=%WORKABS%\model_cache"
 if not exist "%MODELDIR%\checkpoints" mkdir "%MODELDIR%\checkpoints"
 python -c "import torch, os; torch.hub.set_dir(r'%MODELDIR%'); from demucs.pretrained import get_model; get_model('htdemucs'); print('Model ready.')"
@@ -234,7 +237,7 @@ if exist "%WORK%\dist\KaraokeMaker" (
 
 echo.
 echo ========================================
-echo   BUILD COMPLETE!
+echo   BUILD COMPLETE! (CPU-only)
 echo   App location: %FINAL%\
 echo   Run: %FINAL%\KaraokeMaker.exe
 echo.
@@ -242,7 +245,8 @@ echo   (Build scratch files are in %WORK%\ - delete anytime.)
 echo ========================================
 echo.
 echo To distribute: zip the entire %FINAL% folder and share it.
-echo The app auto-detects GPU at runtime (CUDA if present, else CPU).
+echo This CPU build runs on any PC but separates vocals slower
+echo than the GPU build. No NVIDIA card required.
 echo.
 pause
 endlocal

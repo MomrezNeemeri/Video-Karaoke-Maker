@@ -2,8 +2,8 @@
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
-binaries = [('ffmpeg_build/ffmpeg', '.'), ('ffmpeg_build/ffprobe', '.')]
-hiddenimports = ['soundfile', 'numpy', 'numpy.core.multiarray', 'numpy.core._multiarray_umath', 'demucs', 'demucs.pretrained', 'demucs.apply', 'demucs.audio', 'demucs.states', 'demucs.hdemucs', 'demucs.htdemucs', 'demucs.repo', 'demucs.utils', 'diffq', 'openunmix', 'torch', 'torchaudio', 'torchaudio.functional', 'yt_dlp', 'yt_dlp.extractor', 'tqdm']
+binaries = [('ffmpeg_build\\ffmpeg.exe', '.'), ('ffmpeg_build\\ffprobe.exe', '.'), ('mpv_build\\libmpv-2.dll', '.')]
+hiddenimports = ['mpv', 'soundfile', 'numpy', 'numpy.core.multiarray', 'numpy.core._multiarray_umath', 'demucs', 'demucs.pretrained', 'demucs.apply', 'demucs.audio', 'demucs.states', 'demucs.hdemucs', 'demucs.htdemucs', 'demucs.repo', 'demucs.utils', 'diffq', 'openunmix', 'torch', 'torchaudio', 'torchaudio.functional', 'yt_dlp', 'yt_dlp.extractor', 'tqdm']
 tmp_ret = collect_all('demucs')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('diffq')
@@ -13,6 +13,8 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('numpy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('yt_dlp')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('torch')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
@@ -56,10 +58,4 @@ coll = COLLECT(
     upx=True,
     upx_exclude=[],
     name='KaraokeMaker',
-)
-app = BUNDLE(
-    coll,
-    name='KaraokeMaker.app',
-    icon=None,
-    bundle_identifier='com.karaokemaker.app',
 )

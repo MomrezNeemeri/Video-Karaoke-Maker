@@ -1,1 +1,45 @@
-KaraokeMaker.dmg
+@'
+# Build artifacts (NEVER commit these - they are huge, multi-GB)
+_build_workspace/
+_build_workspace_cpu/
+KaraokeMaker_App/
+KaraokeMaker_App_CPU/
+build/
+dist/
+*.spec
+build_env/
+ffmpeg_build/
+mpv_build/
+
+# Bundled binaries (download at build time; don't store in git)
+libmpv-2.dll
+libmpv.2.dylib
+libmpv.dylib
+ffmpeg.exe
+ffprobe.exe
+ffmpeg
+ffprobe
+
+# Logs
+karaoke_export_log.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+*.egg
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Model cache / large downloads
+*.th
+*.ckpt
+*.onnx
+'@ | Set-Content -Encoding utf8 .gitignore

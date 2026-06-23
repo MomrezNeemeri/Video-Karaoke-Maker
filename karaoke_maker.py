@@ -1,5 +1,5 @@
 """
-karaoke maker — strips vocals out of videos using demucs.
+karaoke maker - strips vocals out of videos using demucs.
 also downloads from youtube. mostly.
 """
 
@@ -123,6 +123,95 @@ demucs.audio.save_audio = _patched_save_audio
 
 from demucs.pretrained import get_model
 from demucs.apply import apply_model
+
+# python-mpv powers the Playback tab. it's optional - if libmpv isn't around
+# the tab just shows a message instead of taking the whole app down.
+#
+# annoying gotcha: python-mpv looks up libmpv through the OS loader and flat
+# out refuses relative paths in %PATH%. so grab every dir the dll could be in,
+# make them absolute, and register them before the import. handles both the
+# raw script (dll sitting next to this file) and the frozen exe.
+if sys.platform == "win32":
+    try:
+        _dll_dirs = []
+        # where this script lives
+        try:
+            _dll_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+        except Exception:
+            pass
+        # cwd as a backup
+        _dll_dirs.append(os.path.abspath(os.getcwd()))
+        # and the usual frozen-exe spots
+        if getattr(sys, "frozen", False):
+            if hasattr(sys, "_MEIPASS"):
+                _dll_dirs.append(sys._MEIPASS)
+            _exe_dir = os.path.dirname(sys.executable)
+            _dll_dirs.append(_exe_dir)
+            _dll_dirs.append(os.path.join(_exe_dir, "_internal"))
+
+        _seen = set()
+        for _d in _dll_dirs:
+            _d = os.path.abspath(_d) if _d else _d
+            if not _d or _d in _seen or not os.path.isdir(_d):
+                continue
+            _seen.add(_d)
+            try:
+                os.add_dll_directory(_d)   # the right way to do it on 3.8+
+            except Exception:
+                pass
+            # absolute path here, otherwise python-mpv's find_library throws a fit
+            os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
+    except Exception:
+        pass
+
+elif sys.platform == "darwin":
+    # same idea on mac but with dylibs - point the loader at the dirs where
+    # libmpv could be hiding (next to the script, or inside the .app bundle).
+    try:
+        _dylib_dirs = []
+        try:
+            _dylib_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+        except Exception:
+            pass
+        _dylib_dirs.append(os.path.abspath(os.getcwd()))
+        if getattr(sys, "frozen", False):
+            if hasattr(sys, "_MEIPASS"):
+                _dylib_dirs.append(sys._MEIPASS)
+            _exe_dir = os.path.dirname(sys.executable)
+            _dylib_dirs.append(_exe_dir)
+            # .app puts stuff in Contents/Frameworks and Contents/Resources
+            _contents = os.path.dirname(_exe_dir)
+            _dylib_dirs.append(os.path.join(_contents, "Frameworks"))
+            _dylib_dirs.append(os.path.join(_contents, "Resources"))
+
+        _seen = set()
+        _abs_dirs = []
+        for _d in _dylib_dirs:
+            _d = os.path.abspath(_d) if _d else _d
+            if not _d or _d in _seen or not os.path.isdir(_d):
+                continue
+            _seen.add(_d)
+            _abs_dirs.append(_d)
+        if _abs_dirs:
+            _existing = os.environ.get("DYLD_LIBRARY_PATH", "")
+            os.environ["DYLD_LIBRARY_PATH"] = os.pathsep.join(_abs_dirs + ([_existing] if _existing else []))
+            # python-mpv also reads this one if we hand it the exact file
+            for _d in _abs_dirs:
+                _cand = os.path.join(_d, "libmpv.2.dylib")
+                if os.path.exists(_cand):
+                    os.environ["MPV_DYLIB_PATH"] = _cand
+                    break
+    except Exception:
+        pass
+
+try:
+    import mpv as _mpv
+    MPV_AVAILABLE = True
+    MPV_IMPORT_ERROR = None
+except Exception as _e:
+    _mpv = None
+    MPV_AVAILABLE = False
+    MPV_IMPORT_ERROR = str(_e)
 
 
 # htdemucs > htdemucs_ft for our purposes. ft is slightly better but 4x slower
@@ -564,10 +653,44 @@ class KaraokeProcessor:
                     "FFmpeg encode failed")
         self.on_progress(100)
 
+    def _find_bundled_model_dir(self):
+        # if we shipped the model with the app there's a model_cache folder
+        # with checkpoints/<weights>.th in it. check the usual places.
+        candidates = []
+        try:
+            if getattr(sys, "frozen", False):
+                if hasattr(sys, "_MEIPASS"):
+                    candidates.append(os.path.join(sys._MEIPASS, "model_cache"))
+                exe_dir = os.path.dirname(sys.executable)
+                candidates.append(os.path.join(exe_dir, "model_cache"))
+                candidates.append(os.path.join(exe_dir, "_internal", "model_cache"))
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "model_cache"))
+        except Exception:
+            pass
+        for c in candidates:
+            # only counts if checkpoints/ actually has something in it
+            ckpt = os.path.join(c, "checkpoints")
+            if os.path.isdir(ckpt) and os.listdir(ckpt):
+                return c
+        return None
+
     def _run_demucs(self, wav_path, output_instrumental_path, progress_cb=None):
         progress_cb = progress_cb or self.on_progress
 
-        self.on_status("Loading AI model (first run downloads ~200MB)...")
+        # if we bundled the model, point torch hub at it so there's no download
+        # on first run and the thing works offline. get_model() reads from
+        # <hub_dir>/checkpoints/. no bundled model? torch just downloads it
+        # the first time like normal.
+        bundled = self._find_bundled_model_dir()
+        if bundled:
+            try:
+                torch.hub.set_dir(bundled)
+                self.on_status("Loading AI model (bundled, offline)...")
+            except Exception:
+                self.on_status("Loading AI model...")
+        else:
+            self.on_status("Loading AI model (first run downloads ~80MB)...")
         progress_cb(12)
 
         model = get_model(self.model_name)
@@ -579,15 +702,34 @@ class KaraokeProcessor:
         # the fallback flag it shuffles tensors between cpu and gpu so much
         # that it ends up SLOWER than just using cpu directly. so we don't.
         # M-series cpus are plenty fast anyway, ~1-2 min for a 4 min song
-        if torch.cuda.is_available():
+        cuda_ok = False
+        try:
+            cuda_ok = torch.cuda.is_available()
+        except Exception:
+            cuda_ok = False
+
+        if cuda_ok:
             device = "cuda"
-            device_name = f"GPU ({torch.cuda.get_device_name(0)})"
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+            except Exception:
+                gpu_name = "NVIDIA GPU"
+            device_name = f"GPU — {gpu_name} (CUDA)"
         else:
             device = "cpu"
             if sys.platform == "darwin":
-                device_name = "Apple Silicon CPU"
+                # just so the message reads nicer on mac
+                import platform as _plat
+                is_arm = _plat.machine().lower() in ("arm64", "aarch64")
+                device_name = "Apple Silicon CPU" if is_arm else "Intel Mac CPU"
             else:
-                device_name = "CPU (no NVIDIA GPU detected)"
+                # spell out why we're on cpu - usually it's because someone
+                # installed the cpu-only torch wheel by accident
+                built_with_cuda = getattr(torch.version, "cuda", None)
+                if built_with_cuda:
+                    device_name = "CPU (CUDA build present, but no GPU detected)"
+                else:
+                    device_name = "CPU (this PyTorch is CPU-only - no CUDA support)"
 
         self.on_status(f"Using {device_name}...")
         model.to(device)
@@ -663,8 +805,8 @@ class KaraokeApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Video Karaoke Maker")
-        self.root.geometry("740x780")
-        self.root.minsize(660, 700)
+        self.root.geometry("820x1040")
+        self.root.minsize(720, 920)
         self.root.configure(bg=self.BG)
 
         # without this the app keeps running in the background after window closes
@@ -680,9 +822,37 @@ class KaraokeApp:
         self.keep_vocals = tk.BooleanVar(value=False)
         self.keep_original_video = tk.BooleanVar(value=False)
 
+        # --- Playback tab state ---
+        self.player = None                 # the mpv instance (created lazily)
+        self.pb_file = tk.StringVar()      # path of the loaded video
+        self.pb_pitch = tk.DoubleVar(value=0.0)   # semitones, -12..+12
+        self.pb_tempo = tk.DoubleVar(value=1.0)   # speed multiplier, 0.5..1.5
+        self._pb_seeking = False           # suppress slider feedback loops
+        self._pb_duration = 0.0
+        self._pb_fullscreen = False        # Tk-level fullscreen state
+        self._closing = False              # set true during shutdown
+
         self._styles()
         self._build()
         self._update_mode()
+
+    def _device_badge_text(self):
+        # little label so you can tell at a glance if the GPU's actually in use
+        try:
+            if torch.cuda.is_available():
+                try:
+                    name = torch.cuda.get_device_name(0)
+                except Exception:
+                    name = "NVIDIA GPU"
+                return f"⚡ GPU acceleration ON — {name}"
+        except Exception:
+            pass
+        if sys.platform == "darwin":
+            return "🖥  Running on CPU (Mac) — typical for Apple machines"
+        built = getattr(torch.version, "cuda", None)
+        if built:
+            return "🖥  Running on CPU — no NVIDIA GPU detected"
+        return "🖥  Running on CPU — this PyTorch has no CUDA support"
 
     def _styles(self):
         s = ttk.Style()
@@ -714,13 +884,38 @@ class KaraokeApp:
         s.configure("Mode.TRadiobutton", background=self.BG, foreground=self.TEXT,
                      font=("Segoe UI", 10, "bold"))
 
+        # notebook (the tab header)
+        s.configure("TNotebook", background=self.BG, borderwidth=0)
+        s.configure("TNotebook.Tab", background=self.BG2, foreground=self.DIM,
+                     font=("Segoe UI", 11, "bold"), padding=(22, 10), borderwidth=0)
+        s.map("TNotebook.Tab",
+              background=[("selected", self.CARD)],
+              foreground=[("selected", self.TEXT)])
+        # playback sliders
+        s.configure("Pb.Horizontal.TScale", background=self.BG, troughcolor=self.BG2)
+
     def _build(self):
-        m = ttk.Frame(self.root, style="App.TFrame", padding=30)
+        # tab header across the top
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.convert_tab = ttk.Frame(self.notebook, style="App.TFrame")
+        self.playback_tab = ttk.Frame(self.notebook, style="App.TFrame")
+        self.notebook.add(self.convert_tab, text="  🎵  Convert Karaoke  ")
+        self.notebook.add(self.playback_tab, text="  ▶  Playback  ")
+
+        self._build_convert_tab(self.convert_tab)
+        self._build_playback_tab(self.playback_tab)
+
+    def _build_convert_tab(self, parent):
+        m = ttk.Frame(parent, style="App.TFrame", padding=30)
         m.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(m, text="🎤 Video Karaoke Maker", style="Title.TLabel").pack(pady=(0, 2))
+        ttk.Label(m, text="Video Karaoke Maker", style="Title.TLabel").pack(pady=(0, 2))
         ttk.Label(m, text="Remove vocals from any video using AI  •  Powered by Meta Demucs",
-                  style="Sub.TLabel").pack(pady=(0, 16))
+                  style="Sub.TLabel").pack(pady=(0, 4))
+        # tell them up front whether the GPU is doing the work
+        ttk.Label(m, text=self._device_badge_text(), style="Sub.TLabel").pack(pady=(0, 16))
 
         # file vs URL toggle
         mode_frame = ttk.Frame(m, style="App.TFrame")
@@ -817,6 +1012,631 @@ class KaraokeApp:
                                      style="Status.TLabel")
         self.status_lbl.pack(anchor=tk.W)
 
+    # ----------------------------------------------------------------
+    #  PLAYBACK TAB - mpv embedded in a tk frame with live pitch/tempo.
+    #  pitch goes through the rubberband filter (tweaked live with
+    #  af-command); tempo is just mpv's 'speed' property with
+    #  audio-pitch-correction on so speeding up doesn't chipmunk the audio.
+    # ----------------------------------------------------------------
+    def _build_playback_tab(self, parent):
+        m = ttk.Frame(parent, style="App.TFrame", padding=20)
+        m.pack(fill=tk.BOTH, expand=True)
+
+        self._pb_title = ttk.Label(m, text="▶ Playback", style="Title.TLabel")
+        self._pb_title.pack(pady=(0, 2))
+        self._pb_subtitle = ttk.Label(m, text="Play  •  Control Tempo / Pitch",
+                                      style="Sub.TLabel")
+        self._pb_subtitle.pack(pady=(0, 12))
+
+        if not MPV_AVAILABLE:
+            self._build_playback_unavailable(m)
+            return
+
+        # file picker row
+        file_row = ttk.Frame(m, style="Card.TFrame", padding=12)
+        self._pb_file_row = file_row
+        file_row.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(file_row, text="VIDEO FILE", style="H.TLabel").pack(anchor=tk.W)
+        pr = ttk.Frame(file_row, style="Card.TFrame")
+        pr.pack(fill=tk.X, pady=(6, 0))
+        self._entry(pr, self.pb_file)
+        ttk.Button(pr, text="Open...", style="Sm.TButton",
+                   command=self._pb_pick_file).pack(side=tk.RIGHT, padx=(8, 0))
+
+        # the black box mpv draws video into. expands to fill, with a sane min.
+        self._pb_video_parent = m   # remembered so fullscreen can restore it
+        self.video_frame = tk.Frame(m, bg="black", height=260)
+        self.video_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self.video_frame.pack_propagate(False)
+
+        # transport row: play/pause + seek bar + time + fullscreen
+        transport = ttk.Frame(m, style="App.TFrame")
+        self._pb_transport = transport   # video is re-packed before this on exit
+        transport.pack(fill=tk.X, pady=(0, 6))
+        self.pb_play_btn = ttk.Button(transport, text="▶  Play", style="Sm.TButton",
+                                      command=self._pb_toggle_play)
+        self.pb_play_btn.pack(side=tk.LEFT)
+        self.pb_fs_btn = ttk.Button(transport, text="⛶  Fullscreen", style="Sm.TButton",
+                                    command=self._pb_toggle_fullscreen)
+        self.pb_fs_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.pb_time_lbl = ttk.Label(transport, text="0:00 / 0:00", style="Status.TLabel")
+        self.pb_time_lbl.pack(side=tk.RIGHT)
+        self.pb_seek = ttk.Scale(transport, from_=0, to=1000, orient=tk.HORIZONTAL,
+                                 command=self._pb_on_seek_drag)
+        self.pb_seek.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 12))
+        # distinguish a user drag from programmatic updates
+        self.pb_seek.bind("<ButtonPress-1>", lambda e: setattr(self, "_pb_seeking", True))
+        self.pb_seek.bind("<ButtonRelease-1>", self._pb_seek_commit)
+
+        # ── PITCH control ──
+        pitch_card = ttk.Frame(m, style="Card.TFrame", padding=14)
+        self._pb_pitch_card = pitch_card
+        pitch_card.pack(fill=tk.X, pady=(4, 6))
+        ph = ttk.Frame(pitch_card, style="Card.TFrame")
+        ph.pack(fill=tk.X)
+        ttk.Label(ph, text="🎚  KEY / PITCH", style="H.TLabel").pack(side=tk.LEFT)
+        self.pb_pitch_lbl = ttk.Label(ph, text="0 semitones", style="B.TLabel")
+        self.pb_pitch_lbl.pack(side=tk.RIGHT)
+        ttk.Scale(pitch_card, from_=-12, to=12, orient=tk.HORIZONTAL,
+                  variable=self.pb_pitch, command=self._pb_on_pitch).pack(fill=tk.X, pady=(8, 0))
+        prow = ttk.Frame(pitch_card, style="Card.TFrame")
+        prow.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(prow, text="–1", style="Sm.TButton",
+                   command=lambda: self._pb_nudge_pitch(-1)).pack(side=tk.LEFT)
+        ttk.Button(prow, text="Reset key", style="Sm.TButton",
+                   command=lambda: self._pb_set_pitch(0)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(prow, text="+1", style="Sm.TButton",
+                   command=lambda: self._pb_nudge_pitch(1)).pack(side=tk.LEFT)
+
+        # ── TEMPO control ──
+        tempo_card = ttk.Frame(m, style="Card.TFrame", padding=14)
+        self._pb_tempo_card = tempo_card
+        tempo_card.pack(fill=tk.X, pady=(0, 6))
+        th = ttk.Frame(tempo_card, style="Card.TFrame")
+        th.pack(fill=tk.X)
+        ttk.Label(th, text="⏩  TEMPO / SPEED", style="H.TLabel").pack(side=tk.LEFT)
+        self.pb_tempo_lbl = ttk.Label(th, text="1.00×", style="B.TLabel")
+        self.pb_tempo_lbl.pack(side=tk.RIGHT)
+        ttk.Scale(tempo_card, from_=0.5, to=1.5, orient=tk.HORIZONTAL,
+                  variable=self.pb_tempo, command=self._pb_on_tempo).pack(fill=tk.X, pady=(8, 0))
+        trow = ttk.Frame(tempo_card, style="Card.TFrame")
+        trow.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(trow, text="Reset speed", style="Sm.TButton",
+                   command=lambda: self._pb_set_tempo(1.0)).pack(side=tk.LEFT)
+        ttk.Label(tempo_card,
+                  text="Tempo keeps pitch fixed (and vice-versa) — adjust each independently.",
+                  style="B.TLabel").pack(anchor=tk.W, pady=(6, 0))
+
+        # ── EXPORT: save a new video with the current pitch/tempo baked in ──
+        export_card = ttk.Frame(m, style="Card.TFrame", padding=14)
+        export_card.pack(fill=tk.X, pady=(0, 6))
+        self._pb_export_card = export_card
+        ttk.Label(export_card, text="💾  SAVE THIS VERSION", style="H.TLabel").pack(anchor=tk.W)
+        ttk.Label(export_card,
+                  text="Render a new video file with the current key and tempo applied.",
+                  style="B.TLabel").pack(anchor=tk.W, pady=(2, 8))
+        self.pb_export_btn = ttk.Button(export_card, text="Save adjusted video...",
+                                        style="Sm.TButton", command=self._pb_export)
+        self.pb_export_btn.pack(anchor=tk.W)
+
+        self.pb_status = ttk.Label(m, text="Open a video to start.", style="Status.TLabel")
+        self.pb_status.pack(anchor=tk.W, pady=(2, 0))
+
+    def _build_playback_unavailable(self, parent):
+        card = ttk.Frame(parent, style="Card.TFrame", padding=20)
+        card.pack(fill=tk.X, pady=10)
+        ttk.Label(card, text="⚠  Playback engine (mpv) not available",
+                  style="H.TLabel").pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(card,
+                  text="The live playback tab needs libmpv installed on this machine.\n\n"
+                       "• Windows: the libmpv DLL must be bundled or on PATH\n"
+                       "• macOS:   brew install mpv\n"
+                       "• Linux:   install the libmpv package\n\n"
+                       "You can still use the Convert Karaoke tab normally.",
+                  style="B.TLabel", justify=tk.LEFT).pack(anchor=tk.W)
+        if MPV_IMPORT_ERROR:
+            ttk.Label(card, text=f"Details: {MPV_IMPORT_ERROR}",
+                      style="B.TLabel", wraplength=600, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
+
+    # ---- player lifecycle ----
+    def _pb_ensure_player(self):
+        """create the mpv instance once, bound to the video frame."""
+        if self.player is not None:
+            return self.player
+        wid = str(int(self.video_frame.winfo_id()))
+        # pitch-correction on means changing speed won't shift the pitch.
+        # also throw in a rubberband filter now so we have something to poke
+        # at later when the pitch slider moves.
+        self.player = _mpv.MPV(
+            wid=wid,
+            input_default_bindings=True,
+            input_vo_keyboard=True,
+            osc=True,   # mpv's own seekbar - nice to have in fullscreen
+            keep_open="yes",
+            audio_pitch_correction=True,
+        )
+        # start the rubberband filter at 1.0 (no change) so af-command works
+        try:
+            self.player["af"] = "rubberband=pitch-scale=1.0"
+        except Exception:
+            pass
+
+        # keep the seek bar + time label in sync.
+        # these fire from mpv's own thread; we marshal back to tk via after().
+        # guard against firing while the app is closing (root destroyed) -
+        # a stray callback then would raise and could wedge shutdown.
+        def _safe_after(fn):
+            if getattr(self, "_closing", False) or self.player is None:
+                return
+            try:
+                self.root.after(0, fn)
+            except (tk.TclError, RuntimeError):
+                pass
+
+        @self.player.property_observer("time-pos")
+        def _on_time(_name, value):
+            _safe_after(lambda: self._pb_update_time(value))
+
+        @self.player.property_observer("duration")
+        def _on_dur(_name, value):
+            if value:
+                self._pb_duration = value
+
+        @self.player.property_observer("pause")
+        def _on_pause(_name, value):
+            txt = "▶  Play" if value else "⏸  Pause"
+            _safe_after(lambda: self._pb_set_playbtn(txt))
+
+        return self.player
+
+    def _pb_pick_file(self):
+        all_ext = " ".join(f"*{e}" for e in SUPPORTED_VIDEO + SUPPORTED_AUDIO)
+        p = filedialog.askopenfilename(
+            title="Open Video or Audio for Playback",
+            filetypes=[("All Supported", all_ext), ("All Files", "*.*")]
+        )
+        if not p:
+            return
+        self.pb_file.set(p)
+        self._pb_load(p)
+
+    def _pb_load(self, path):
+        try:
+            player = self._pb_ensure_player()
+            player.play(path)
+            player.pause = False
+            # re-apply current slider values to the freshly loaded file
+            self.root.after(300, self._pb_apply_pitch)
+            self.root.after(300, self._pb_apply_tempo)
+            self._pb_set_status("Playing — drag the sliders to change key and tempo.")
+        except Exception as e:
+            messagebox.showerror("Playback error", f"Could not play this file:\n\n{e}")
+
+    def _pb_toggle_play(self):
+        if self.player is None:
+            if self.pb_file.get().strip():
+                self._pb_load(self.pb_file.get().strip())
+            return
+        try:
+            self.player.pause = not self.player.pause
+        except Exception:
+            pass
+
+    def _pb_toggle_fullscreen(self):
+        # whatever you do, do NOT reparent the video frame. mpv draws into that
+        # frame's window handle and moving it to a new parent kills the handle -
+        # you get a black screen. learned that the hard way. so we just toggle
+        # the OS fullscreen state and let the frame (which already expands) fill it.
+        if self.player is None:
+            if self.pb_file.get().strip():
+                self._pb_load(self.pb_file.get().strip())
+            else:
+                messagebox.showinfo("No video", "Open a video first, then go fullscreen.")
+            return
+
+        if not getattr(self, "_pb_fullscreen", False):
+            self._enter_fullscreen()
+        else:
+            self._exit_fullscreen()
+
+    def _enter_fullscreen(self):
+        self._pb_fullscreen = True
+        try:
+            self.notebook.select(self.playback_tab)
+        except Exception:
+            pass
+        # hide everything except the video so it fills the screen. note we
+        # only pack_forget the siblings - never the video frame itself, see above.
+        for w in (self._pb_title, self._pb_subtitle, self._pb_file_row,
+                  self._pb_pitch_card, self._pb_tempo_card, self._pb_export_card,
+                  self.pb_status):
+            try:
+                w.pack_forget()
+            except Exception:
+                pass
+        try:
+            self.root.attributes("-fullscreen", True)
+        except Exception:
+            pass
+        # bind the exit keys and grab focus so esc/f actually register
+        self.root.bind("<Escape>", self._fs_key_exit)
+        self.root.bind("<f>", self._fs_key_exit)
+        self.root.bind("<F11>", self._fs_key_exit)
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+        try:
+            self.pb_fs_btn.config(text="⛶  Exit (Esc)")
+        except Exception:
+            pass
+
+    def _fs_key_exit(self, _evt=None):
+        self._exit_fullscreen()
+
+    def _exit_fullscreen(self):
+        if not getattr(self, "_pb_fullscreen", False):
+            return
+        self._pb_fullscreen = False
+        try:
+            self.root.attributes("-fullscreen", False)
+        except Exception:
+            pass
+        for seq in ("<Escape>", "<f>", "<F11>"):
+            try:
+                self.root.unbind(seq)
+            except Exception:
+                pass
+        # put everything back. the video frame and transport never moved, so
+        # we just re-pack the hidden widgets around them with before=/after=.
+        try:
+            # order matters here - file_row first since the others anchor to it
+            self._pb_file_row.pack(fill=tk.X, pady=(0, 10), before=self.video_frame)
+            self._pb_subtitle.pack(pady=(0, 12), before=self._pb_file_row)
+            self._pb_title.pack(pady=(0, 2), before=self._pb_subtitle)
+            self._pb_pitch_card.pack(fill=tk.X, pady=(4, 6), after=self._pb_transport)
+            self._pb_tempo_card.pack(fill=tk.X, pady=(0, 6), after=self._pb_pitch_card)
+            self._pb_export_card.pack(fill=tk.X, pady=(0, 6), after=self._pb_tempo_card)
+            self.pb_status.pack(anchor=tk.W, pady=(2, 0), after=self._pb_export_card)
+        except Exception:
+            pass
+        try:
+            self.pb_fs_btn.config(text="⛶  Fullscreen")
+        except Exception:
+            pass
+
+    # ---- pitch ----
+    def _pb_on_pitch(self, _val):
+        semis = round(self.pb_pitch.get())
+        self.pb_pitch_lbl.config(text=f"{semis:+d} semitones" if semis else "0 semitones")
+        self._pb_apply_pitch()
+
+    def _pb_nudge_pitch(self, delta):
+        self._pb_set_pitch(round(self.pb_pitch.get()) + delta)
+
+    def _pb_set_pitch(self, semis):
+        semis = max(-12, min(12, semis))
+        self.pb_pitch.set(semis)
+        self.pb_pitch_lbl.config(text=f"{semis:+d} semitones" if semis else "0 semitones")
+        self._pb_apply_pitch()
+
+    def _pb_apply_pitch(self):
+        if self.player is None:
+            return
+        semis = self.pb_pitch.get()
+        scale = 2 ** (semis / 12.0)   # semitones -> frequency multiplier
+        try:
+            # change the live rubberband filter without restarting playback
+            self.player.command("af-command", "rubberband", "set-pitch-scale", f"{scale:.6f}")
+        except Exception:
+            # fallback: rebuild the filter chain
+            try:
+                self.player["af"] = f"rubberband=pitch-scale={scale:.6f}"
+            except Exception:
+                pass
+
+    # ---- tempo ----
+    def _pb_on_tempo(self, _val):
+        spd = self.pb_tempo.get()
+        self.pb_tempo_lbl.config(text=f"{spd:.2f}×")
+        self._pb_apply_tempo()
+
+    def _pb_set_tempo(self, spd):
+        spd = max(0.5, min(1.5, spd))
+        self.pb_tempo.set(spd)
+        self.pb_tempo_lbl.config(text=f"{spd:.2f}×")
+        self._pb_apply_tempo()
+
+    def _pb_apply_tempo(self):
+        if self.player is None:
+            return
+        try:
+            # pitch correction is on, so bumping speed leaves the pitch alone
+            self.player.speed = self.pb_tempo.get()
+        except Exception:
+            pass
+
+    # ---- export adjusted video ----
+    def _pb_export(self):
+        src = self.pb_file.get().strip()
+        if not src or not os.path.isfile(src):
+            messagebox.showinfo("No video", "Open a video first, then save an adjusted version.")
+            return
+
+        semis = round(self.pb_pitch.get())
+        tempo = round(self.pb_tempo.get(), 2)
+        if semis == 0 and abs(tempo - 1.0) < 0.001:
+            if not messagebox.askyesno(
+                "No changes",
+                "Pitch and tempo are both at default, so the saved file will "
+                "match the original. Save anyway?"):
+                return
+
+        # warn that tempo changes re-encode the video and take longer
+        if abs(tempo - 1.0) >= 0.001:
+            if not messagebox.askyesno(
+                "Tempo change re-encodes video",
+                "Changing the tempo means the video has to be re-encoded, which "
+                "can take a few minutes for a full song. Pitch-only changes are "
+                "much faster.\n\nContinue?"):
+                return
+
+        base, ext = os.path.splitext(os.path.basename(src))
+        tag = []
+        if semis:
+            tag.append(f"key{semis:+d}")
+        if abs(tempo - 1.0) >= 0.001:
+            tag.append(f"{tempo:.2f}x")
+        suffix = ("_" + "_".join(tag)) if tag else "_adjusted"
+        out = filedialog.asksaveasfilename(
+            title="Save Adjusted Video",
+            defaultextension=ext or ".mp4",
+            initialfile=f"{base}{suffix}{ext or '.mp4'}",
+            filetypes=[("Video", "*.mp4 *.mkv *.mov"), ("All Files", "*.*")])
+        if not out:
+            return
+
+        self._pb_export_cancel = False
+        self.pb_export_btn.config(state="disabled", text="Saving... (click Cancel)",
+                                  command=self._pb_export_cancel_now)
+        self._pb_set_status("Rendering... 0%")
+        t = threading.Thread(target=self._pb_export_worker,
+                             args=(src, out, semis, tempo), daemon=True)
+        t.start()
+
+    def _pb_export_cancel_now(self):
+        self._pb_export_cancel = True
+        self._pb_set_status("Cancelling...")
+        proc = getattr(self, "_pb_export_proc", None)
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _pb_export_worker(self, src, out, semis, tempo):
+        try:
+            ffmpeg = get_ffmpeg_path()
+            duration = self._probe_duration(src) or 0
+
+            # two ways to do the pitch shift: rubberband (sounds better) or the
+            # old asetrate+atempo trick (uglier but works in any ffmpeg). try
+            # rubberband first, fall back if ffmpeg chokes. saves us from having
+            # to reliably detect whether rubberband is even compiled in.
+            def chain(use_rb):
+                pitch_scale = 2 ** (semis / 12.0)
+                parts = []
+                if abs(tempo - 1.0) >= 0.001:
+                    parts.append(f"atempo={tempo:.4f}")
+                if semis != 0:
+                    if use_rb:
+                        parts.append(f"rubberband=pitch-scale={pitch_scale:.6f}")
+                    else:
+                        # speed the audio up to raise pitch, then atempo it back
+                        # to the right length
+                        sr = 44100
+                        parts.append(f"asetrate={int(sr*pitch_scale)}")
+                        parts.append(f"aresample={sr}")
+                        parts.append(f"atempo={1.0/pitch_scale:.6f}")
+                return ",".join(parts)
+
+            def build_cmd(afilter):
+                c = [ffmpeg, "-y", "-i", src]
+                if abs(tempo - 1.0) >= 0.001:
+                    # changing tempo means re-timing the video too (setpts) and
+                    # re-encoding it - no way around that
+                    vfactor = 1.0 / tempo
+                    c += ["-filter_complex",
+                          f"[0:v]setpts={vfactor:.6f}*PTS[v];[0:a]{afilter}[a]",
+                          "-map", "[v]", "-map", "[a]",
+                          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                          "-pix_fmt", "yuv420p"]
+                elif afilter:
+                    # pitch only - leave the video stream untouched, way faster
+                    c += ["-af", afilter, "-c:v", "copy"]
+                else:
+                    c += ["-c", "copy"]
+                # we touched the audio so it has to be re-encoded; aac is safe
+                if afilter:
+                    c += ["-c:a", "aac", "-b:a", "320k"]
+                c += ["-progress", "pipe:1", "-nostats", out]
+                return c
+
+            # dump everything to a log so failures aren't a mystery
+            log_path = self._export_log_path()
+
+            attempts = [chain(True)]
+            # only worth a second try if pitch is in play (that's the rubberband risk)
+            if semis != 0:
+                attempts.append(chain(False))
+
+            last_err = ""
+            for idx, afilter in enumerate(attempts):
+                if self._pb_export_cancel:
+                    break
+                cmd = build_cmd(afilter)
+                rc, errtail = self._run_export_cmd(cmd, duration, log_path, idx)
+                if rc == 0 and not self._pb_export_cancel:
+                    self.root.after(0, lambda: self._pb_export_done(out, None))
+                    return
+                last_err = errtail
+
+            if self._pb_export_cancel:
+                try:
+                    if os.path.exists(out):
+                        os.remove(out)
+                except Exception:
+                    pass
+                self.root.after(0, lambda: self._pb_export_done(out, "cancelled"))
+            else:
+                msg = ("FFmpeg could not export this file.\n\n"
+                       + last_err +
+                       f"\n\nA full log was saved to:\n{log_path}")
+                self.root.after(0, lambda m=msg: self._pb_export_done(out, m))
+        except Exception as e:
+            self.root.after(0, lambda: self._pb_export_done(out, str(e)))
+
+    def _run_export_cmd(self, cmd, duration, log_path, attempt_idx):
+        # log the exact command first so we can see what we ran
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n=== Export attempt {attempt_idx+1} ===\n")
+                f.write(" ".join(f'"{x}"' if " " in x else x for x in cmd) + "\n\n")
+        except Exception:
+            pass
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                creationflags=HIDE_CONSOLE, text=True)
+        self._pb_export_proc = proc
+
+        # ffmpeg's real errors go to stderr - drain it on its own thread (so it
+        # can't fill the pipe and deadlock) and keep the tail + write to the log
+        tail = []
+        def _drain_err():
+            try:
+                for el in proc.stderr:
+                    el = el.rstrip()
+                    tail.append(el)
+                    if len(tail) > 80:
+                        tail.pop(0)
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(el + "\n")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        et = threading.Thread(target=_drain_err, daemon=True)
+        et.start()
+
+        # stdout carries the -progress output; parse out_time_ms for a percent
+        for line in proc.stdout:
+            if self._pb_export_cancel:
+                break
+            line = line.strip()
+            if line.startswith("out_time_ms=") and duration > 0:
+                try:
+                    ms = int(line.split("=", 1)[1])
+                    pct = min(99, int((ms / 1_000_000) / duration * 100))
+                    self.root.after(0, lambda p=pct:
+                                    self._pb_set_status(f"Rendering... {p}%"))
+                except Exception:
+                    pass
+        proc.wait()
+        et.join(timeout=1.0)
+        self._pb_export_proc = None
+        # if it failed, the useful bit is the last few stderr lines
+        return proc.returncode, "\n".join(tail[-10:])
+
+    @staticmethod
+    def _export_log_path():
+        # drop the log on the Desktop if we can find it, else just use cwd
+        try:
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            if os.path.isdir(desktop):
+                return os.path.join(desktop, "karaoke_export_log.txt")
+        except Exception:
+            pass
+        return os.path.join(os.getcwd(), "karaoke_export_log.txt")
+
+    @staticmethod
+    def _probe_duration(path):
+        # ask ffprobe how long the file is, so we can show a real percentage
+        try:
+            ffmpeg = get_ffmpeg_path()
+            ffprobe = os.path.join(os.path.dirname(ffmpeg),
+                                   "ffprobe.exe" if sys.platform == "win32" else "ffprobe")
+            if not os.path.isfile(ffprobe):
+                ffprobe = "ffprobe"
+            r = subprocess.run([ffprobe, "-v", "error", "-show_entries",
+                                "format=duration", "-of", "csv=p=0", path],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               creationflags=HIDE_CONSOLE, text=True)
+            return float(r.stdout.strip())
+        except Exception:
+            return 0
+
+    def _pb_export_done(self, out, error):
+        try:
+            self.pb_export_btn.config(state="normal", text="Save adjusted video...",
+                                      command=self._pb_export)
+        except Exception:
+            pass
+        if error == "cancelled":
+            self._pb_set_status("Export cancelled.")
+        elif error:
+            self._pb_set_status("Export failed.")
+            messagebox.showerror("Export failed",
+                                 f"Could not save the adjusted video:\n\n{error[:600]}")
+        else:
+            self._pb_set_status("Saved adjusted video.")
+            messagebox.showinfo("Saved", f"Adjusted video saved to:\n{out}")
+
+    # ---- seek + time ----
+    def _pb_update_time(self, pos):
+        if self.player is None or pos is None:
+            return
+        dur = self._pb_duration or 0
+        self.pb_time_lbl.config(text=f"{self._fmt_time(pos)} / {self._fmt_time(dur)}")
+        if dur > 0 and not self._pb_seeking:
+            try:
+                self.pb_seek.set((pos / dur) * 1000)
+            except Exception:
+                pass
+
+    def _pb_on_seek_drag(self, _val):
+        # while dragging we just update the time label preview; commit on release
+        if self._pb_seeking and self._pb_duration:
+            frac = float(self.pb_seek.get()) / 1000.0
+            self.pb_time_lbl.config(
+                text=f"{self._fmt_time(frac * self._pb_duration)} / {self._fmt_time(self._pb_duration)}")
+
+    def _pb_seek_commit(self, _evt):
+        if self.player is not None and self._pb_duration:
+            frac = float(self.pb_seek.get()) / 1000.0
+            try:
+                self.player.command("seek", frac * self._pb_duration, "absolute")
+            except Exception:
+                pass
+        self._pb_seeking = False
+
+    @staticmethod
+    def _fmt_time(secs):
+        secs = int(secs or 0)
+        return f"{secs // 60}:{secs % 60:02d}"
+
+    def _pb_set_status(self, s):
+        try:
+            self.pb_status.config(text=s)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _pb_set_playbtn(self, txt):
+        try:
+            self.pb_play_btn.config(text=txt)
+        except (tk.TclError, RuntimeError):
+            pass
+
     def _entry(self, parent, var):
         # standard text entry, just styled to match the theme
         e = tk.Entry(parent, textvariable=var,
@@ -825,7 +1645,33 @@ class KaraokeApp:
                      highlightthickness=1, highlightcolor=self.ACCENT,
                      highlightbackground=self.BORDER)
         e.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
+        self._attach_entry_menu(e)
         return e
+
+    def _attach_entry_menu(self, entry):
+        # tk entries don't come with a right-click menu, which trips people up
+        # (they expect paste to be there). so build one ourselves.
+        menu = tk.Menu(entry, tearoff=0)
+        menu.add_command(label="Cut",
+                         command=lambda: entry.event_generate("<<Cut>>"))
+        menu.add_command(label="Copy",
+                         command=lambda: entry.event_generate("<<Copy>>"))
+        menu.add_command(label="Paste",
+                         command=lambda: entry.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Select All",
+                         command=lambda: entry.select_range(0, tk.END))
+
+        def show(ev):
+            try:
+                entry.focus_set()
+                menu.tk_popup(ev.x_root, ev.y_root)
+            finally:
+                menu.grab_release()
+
+        # right-click is button-3 on windows/linux, button-2 on some macs
+        entry.bind("<Button-3>", show)
+        entry.bind("<Button-2>", show)
 
     def _update_mode(self):
         # show/hide cards based on whether we're in file or url mode
@@ -970,8 +1816,19 @@ class KaraokeApp:
         self._reset("")
         self.status_lbl.config(text="✅ Done! Karaoke file saved.", style="Ok.TLabel")
         output_path = self.processor.output_path if self.processor else "?"
-        messagebox.showinfo("Success", f"Saved to:\n{output_path}")
         self.status_lbl.config(style="Status.TLabel")
+        # offer to jump straight into the Playback tab with the result loaded,
+        # but only for video output (mpv plays audio too, but the singer wants video)
+        if MPV_AVAILABLE and output_path and os.path.isfile(output_path):
+            if messagebox.askyesno(
+                "Success",
+                f"Saved to:\n{output_path}\n\nOpen it in the Playback tab to sing "
+                "and adjust key/tempo?"):
+                self.pb_file.set(output_path)
+                self.notebook.select(self.playback_tab)
+                self.root.after(200, lambda: self._pb_load(output_path))
+        else:
+            messagebox.showinfo("Success", f"Saved to:\n{output_path}")
 
     def _fail(self, msg):
         # if it's the special bot-detection signal, show the nice dialog instead
@@ -1084,10 +1941,35 @@ class KaraokeApp:
             self.status_lbl.config(text=status)
 
     def _on_close(self):
-        # cancel any running work
+        self._closing = True
+        # stop any conversion that's running
         if self.processor:
             try:
                 self.processor.cancel()
+            except Exception:
+                pass
+
+        # shutting mpv down is fiddly: python-mpv's terminate() deadlocks if
+        # property observers are still attached (it waits on the event queue,
+        # which we're blocking). so unhook the observers first, then terminate
+        # on a throwaway thread we don't wait on. if it still hangs, the
+        # os._exit() at the bottom takes care of it.
+        player = self.player
+        self.player = None
+        if player is not None:
+            try:
+                for prop in ("time-pos", "duration", "pause"):
+                    try:
+                        player.unobserve_property(prop)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                t = threading.Thread(target=lambda: self._safe_terminate(player),
+                                     daemon=True)
+                t.start()
+                t.join(timeout=1.0)   # wait a sec, but don't get stuck on it
             except Exception:
                 pass
 
@@ -1097,9 +1979,17 @@ class KaraokeApp:
         except Exception:
             pass
 
-        # nuclear option. without this torch leaves threads alive and the app
-        # just hangs around in task manager forever even after window closes
+        # torch and mpv both leave threads running in the background, so a
+        # clean exit isn't enough - this makes sure the process actually dies
+        # instead of hanging around as "not responding".
         os._exit(0)
+
+    @staticmethod
+    def _safe_terminate(player):
+        try:
+            player.terminate()
+        except Exception:
+            pass
 
     def run(self):
         try:
